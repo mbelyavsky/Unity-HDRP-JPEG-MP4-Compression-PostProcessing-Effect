@@ -1,0 +1,226 @@
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/ShaderLibrary/ShaderVariables.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/Material.hlsl"
+
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/Builtin/BuiltinData.hlsl"
+
+//Two different kernel configurations for both performance modes
+#pragma kernel CSMain //ACCURATE
+//#pragma kernel CSMain FAST
+
+//The Input/Output Textures
+Texture2D<float4> Last;
+RW_TEXTURE2D_X(float4, Input);
+Texture2D<float4> Motion;
+RW_TEXTURE2D_X(float4, Result);
+
+//Texture Dimentions
+uint ResultWidth;
+uint ResultHeight;
+
+//User Settings
+int FastPerfomanceMode;
+
+//Spacial Compression Settings
+bool UseSpacial;
+float CompressionThreshold;
+
+//Temporal Compression Settings
+bool UseTemporal;
+bool UseIFrames;
+float Bitrate;
+float BitrateArtifacts;
+//Deternimes if the current frame should be an I-Frame
+bool IsIFrame;
+
+//Used to quantize the chrominance in Fast mode
+float Quantize(float input, int resolution){
+    input *= resolution;
+    input = floor(input.x);
+    input /= resolution;
+    return input;
+}
+
+//Yuv to RGB color space
+float3 YuvToRGB(float3 yuv){
+    float3 color;
+    color.b = yuv.x + (1.0/0.493) * yuv.y;
+    color.r = yuv.x + (1.0/0.877) * yuv.z;
+    color.g = (1.0/0.587) * yuv.x - (0.299/0.587) * color.r - (0.114/0.587) * color.b;
+    return color;
+}
+
+//RGB to Yuv color space
+float3 RGBToYuv(float3 color){
+    float Y = 0.299 * color.r + 0.587 * color.g + 0.114 * color.b;
+    float u = 0.493 * (color.b - Y);
+    float v = 0.877 * (color.r - Y);
+    //In case we are using the Fast performance mode we will crunch down on the chrominance values during the conversion
+    if (FastPerfomanceMode)
+    {
+        u = Quantize(u, lerp(256, 32, CompressionThreshold * 0.5));
+        v = Quantize(v, lerp(256, 32, CompressionThreshold * 0.5));
+    }
+    return float3(Y, u, v);
+}
+
+//Utility function to make sure a pixel position is within the bounds of the visible screen
+bool IsInBounds(int2 pos, int w, int h){
+    return pos.x >= 0 && pos.x < w - 8 && pos.y >= 0 && pos.y < h - 8;
+}
+
+//Shared memory for the color information
+groupshared float3 pixelBlock[8][8];
+//Shared memory for the spectral information
+groupshared float3 dct[8][8];
+
+//Shared memory to determine if a pixelBlock should be updated
+//Only used in the MP4 compression
+groupshared bool update;
+//Shared memory that holds a single B-Frame offset for the whole pixelBlock
+groupshared int2 offset;
+
+[numthreads(8,8,1)]
+//8x8 threads are ideal for this algorithm since the Discrete Cosine Transform used in JPEG compression operates
+//on an 8x8 block of pixels
+void CSMain (uint3 id : SV_DispatchThreadID, uint3 groupThreadID : SV_GroupThreadID, uint3 groupID : SV_GroupID)
+{
+    //Loop indices are defined outside of any loops because HLSL likes to complain about it otherwise
+    int ix, iy;
+
+    //Fetch Input Pixels and Convert to Yuv
+    pixelBlock[groupThreadID.x][groupThreadID.y] = RGBToYuv(Input[COORD_TEXTURE2D_X(groupThreadID.xy + groupID.xy * 8)].rgb);
+    GroupMemoryBarrierWithGroupSync();
+
+    //The entire temporal compression process takes place here
+    if(UseTemporal){
+        //Read the normalized motion vectors we got from the MotionVectorSource shader
+        float2 motion = Motion[id.xy / float2(1, 1.53)].rg;
+        
+        
+        //Check that the groupThreadID is 0
+        //This next part determines if this pixelBlock should be updated and how,
+        //thus it only needs to be executed once per thread group
+        if(groupThreadID.x == 0 && groupThreadID.y == 0){
+            //Motion Vectors indicate the screenspace/uv position change of a pixel
+            //To convert these normalized screen positions to actual pixel coordinates we simply need to multiply them
+            //by the screens dimensions, which can be obtained as follows:
+            uint w, h;
+            w = _ScreenSize.x;
+            h = _ScreenSize.y;
+            //Now apply the dimensions to the read motion vector
+            float2 pixelMotion = motion * float2(w, h);
+            //write the result into the groupshared offset variable
+            offset = int2(pixelMotion.x, pixelMotion.y);
+            //There are multiple conditions that control wether a pixelBlock should be updated or not
+            //One of them is the difference in luminance from the last frame
+            float YChange = abs(pixelBlock[0][0].r - RGBToYuv(Last[groupID.xy * 8].rgb).r);
+            //Now we write to the groupshared update variable to mark this entire pixelBlocks state
+            //Conditions for updating a pixelBlock
+            //Condition 1 - If the current pixelLocation + the motion vector ends up outside of the screen bounds,
+            //we need to fetch a fresh block of pixels, else we will end up with black
+            update = !IsInBounds(groupThreadID.xy + groupID.xy * 8 - offset, w, h)
+                    //Here we simply check if the luminance difference exceeds a certain threshold,
+                    //which is dependant on the Birate
+                     || YChange > (1.0 - Bitrate)
+                    //Of course we also need to update if the current frame is an I-Frame
+                     || IsIFrame;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        //In case we don't have to update/refresh this pixelBlock we simply use the motion vector to obtain moved
+        //color values from the last frame
+        if(!update){
+            //Here we make use of the groupshared offset value
+            Result[COORD_TEXTURE2D_X(groupThreadID.xy + groupID.xy * 8)] = Last[groupThreadID.xy + groupID.xy * 8 - offset];
+            return;
+        }
+    }
+
+    //This part contains the Spacial Compression algorithm
+    if(UseSpacial){
+        //Perform the DCT on each pixel in this thread group
+        dct[groupThreadID.x][groupThreadID.y] = 0.0;
+        for(ix = 0; ix < 8; ix++){
+            for(iy = 0; iy < 8; iy++){
+                float factor = cos((3.141592654 * (2 * ix + 1) * groupThreadID.x) / 16.0) 
+                            * cos((3.141592654 * (2 * iy + 1) * groupThreadID.y) / 16.0);
+                dct[groupThreadID.x][groupThreadID.y].r += pixelBlock[ix][iy].r * factor;
+                if (!FastPerfomanceMode)
+                {
+                    dct[groupThreadID.x][groupThreadID.y].g += pixelBlock[ix][iy].g * factor;
+                    dct[groupThreadID.x][groupThreadID.y].b += pixelBlock[ix][iy].b * factor;
+                }
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        //Quantize the DCT coefficients
+        //In reality this uses 8x8 Quantization tables for luminance and chrominance,
+        //however simply eliminating all coefficients below a set threshold works just as well
+        if(abs(dct[groupThreadID.x][groupThreadID.y].r) < CompressionThreshold)
+            dct[groupThreadID.x][groupThreadID.y].r = 0.0;
+        if (!FastPerfomanceMode)
+        {
+            if(abs(dct[groupThreadID.x][groupThreadID.y].g) < CompressionThreshold)
+                dct[groupThreadID.x][groupThreadID.y].g = 0.0;
+            if(abs(dct[groupThreadID.x][groupThreadID.y].b) < CompressionThreshold)
+                dct[groupThreadID.x][groupThreadID.y].b = 0.0;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        //Perform the inverse DCT
+        if (!FastPerfomanceMode)
+        {
+            pixelBlock[groupThreadID.x][groupThreadID.y] = 0.0;
+        } else
+        {
+            pixelBlock[groupThreadID.x][groupThreadID.y].r = 0.0;
+        }
+        for(ix = 0; ix < 8; ix++){
+            for(iy = 0; iy < 8; iy++){
+                float3 dctTemp = dct[ix][iy];
+                dctTemp *= (ix == 0 ? 0.353553390593 : 0.5);
+                dctTemp *= (iy == 0 ? 0.353553390593 : 0.5);
+                float factor = cos((3.141592654 * (2 * groupThreadID.x + 1) * ix) / 16.0) 
+                                    * cos((3.141592654 * (2 * groupThreadID.y + 1) * iy) / 16.0);
+                pixelBlock[groupThreadID.x][groupThreadID.y].r += dctTemp.r * factor;
+                if (!FastPerfomanceMode)
+                {
+                    pixelBlock[groupThreadID.x][groupThreadID.y].g += dctTemp.g * factor;
+                    pixelBlock[groupThreadID.x][groupThreadID.y].b += dctTemp.b * factor;
+                }
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        //Convert to RGB and output
+        //When using Temporal Compression we need to look out for Bitrate Artifacts
+        if(UseTemporal){
+            //We simply lerp between the processed color and the last frame using the BitrateArtifacts parameter as the percentage
+            if (!FastPerfomanceMode)
+            {
+                Result[COORD_TEXTURE2D_X(groupThreadID.xy + groupID.xy * 8)] = lerp(float4(YuvToRGB(pixelBlock[groupThreadID.x][groupThreadID.y] * 0.125), 1.0),
+                                                                Last[groupThreadID.xy + groupID.xy * 8 - offset], BitrateArtifacts);
+                
+            } else
+            {
+                Result[COORD_TEXTURE2D_X(groupThreadID.xy + groupID.xy * 8)] = lerp(float4(YuvToRGB(pixelBlock[groupThreadID.x][groupThreadID.y] * float3(0.125, 1.0, 1.0)), 1.0),
+                                                                Last[groupThreadID.xy + groupID.xy * 8 - offset], BitrateArtifacts);
+            }
+        }
+        //If not, we simply read the processed color from the pixelBlock
+        else{
+            if (!FastPerfomanceMode) //if accurate
+            {
+                Result[COORD_TEXTURE2D_X(groupThreadID.xy + groupID.xy * 8)] = float4(YuvToRGB(pixelBlock[groupThreadID.x][groupThreadID.y] * 0.125), 1.0);
+            } else  //if fast
+            {
+                Result[COORD_TEXTURE2D_X(groupThreadID.xy + groupID.xy * 8)] = float4(YuvToRGB(pixelBlock[groupThreadID.x][groupThreadID.y] * float3(0.125, 1.0, 1.0)), 1.0);
+            }
+        }
+    }
+    else
+        //If we don't want to use Spacial compression we can just convert the input colors back to RGB and output them
+        Result[COORD_TEXTURE2D_X(groupThreadID.xy + groupID.xy * 8)] = float4(YuvToRGB(pixelBlock[groupThreadID.x][groupThreadID.y]), 1.0);
+}
